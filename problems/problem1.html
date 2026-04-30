@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>CPSC 487/587</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/10.3.0/math.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/quaternion@1.5.1/quaternion.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/numeric@1.2.6/numeric-1.2.6.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+              "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+              "three/": "https://unpkg.com/three@0.160.0/"
+            }
+        }
+    </script>
+</head>
+<body>
+<script type="module">
+    import * as THREE from "three";
+    import {ThreeEngine} from "../js/utils/utils_three.js";
+    import {B1Z1Robot, XArm7Robot} from "../js/utils/utils_robot.js";
+
+    let engine = ThreeEngine.new_default_3d();
+
+    // Select either robot mesh set here.
+    let robot = new XArm7Robot();
+    // let robot = new B1Z1Robot();
+    await robot.spawn_robot(engine);
+
+    const uiState = {
+        showMesh: true,
+        showWireframe: false,
+        assemblyProgress: 1.0,
+        axisLength: 0.12,
+        axisWidth: 0.002
+    };
+    const showJointAxes = {};
+
+    const dofValues = new Array(robot.num_dofs()).fill(0);
+    const gui = new lil.GUI();
+    gui.title(`${robot.get_robot_name()} FK Controls`);
+
+    const displayFolder = gui.addFolder("Display");
+    displayFolder.add(uiState, "showMesh").name("Show meshes");
+    displayFolder.add(uiState, "showWireframe").name("Show wireframe");
+    displayFolder.add(uiState, "assemblyProgress", 0.0, 1.0, 0.001).name("Kinematic Hierarchy");
+    displayFolder.add(uiState, "axisLength", 0.03, 0.3, 0.005).name("Axis length");
+    displayFolder.add(uiState, "axisWidth", 0.001, 0.01, 0.0005).name("Axis width");
+    displayFolder.open();
+
+    const dofFolder = gui.addFolder("Joint DOFs");
+    const axisFolder = gui.addFolder("Joint Axes");
+    robot.joints.forEach((joint) => {
+        showJointAxes[joint.joint_idx] = false;
+        axisFolder.add(showJointAxes, joint.joint_idx).name(joint.joint_name);
+        if (joint.joint_num_dofs !== 1 || joint.dof_idx === undefined) {
+            return;
+        }
+        const controllerObject = {value: 0};
+        const range = joint.upper_bound - joint.lower_bound;
+        const step = range > 0 ? Math.max(range / 300.0, 0.0005) : 0.001;
+        dofFolder
+            .add(controllerObject, "value", joint.lower_bound, joint.upper_bound, step)
+            .name(joint.joint_name)
+            .onChange((v) => {
+                dofValues[joint.dof_idx] = v;
+            });
+    });
+    dofFolder.open();
+    axisFolder.close();
+
+    function toVector3Array(axis) {
+        if (Array.isArray(axis) && axis.length === 3 && typeof axis[0] === "number") {
+            return axis;
+        }
+        if (Array.isArray(axis) && axis.length === 3 && Array.isArray(axis[0])) {
+            return [axis[0][0], axis[1][0], axis[2][0]];
+        }
+        return [0, 0, 1];
+    }
+
+    function identity4() {
+        return [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ];
+    }
+
+    function matMul4(a, b) {
+        const out = identity4();
+        for (let i = 0; i < 4; i++) {
+            for (let j = 0; j < 4; j++) {
+                let sum = 0;
+                for (let k = 0; k < 4; k++) {
+                    sum += a[i][k] * b[k][j];
+                }
+                out[i][j] = sum;
+            }
+        }
+        return out;
+    }
+
+    function makeTransformFromQuaternionAndTranslation(q, t) {
+        const m = new THREE.Matrix4();
+        m.makeRotationFromQuaternion(q);
+        m.setPosition(t[0], t[1], t[2]);
+        const e = m.elements;
+        return [
+            [e[0], e[4], e[8], e[12]],
+            [e[1], e[5], e[9], e[13]],
+            [e[2], e[6], e[10], e[14]],
+            [0, 0, 0, 1]
+        ];
+    }
+
+    function makeStaticJointTransform(joint) {
+        const q = new THREE.Quaternion().setFromEuler(
+            new THREE.Euler(joint.rpy[0], joint.rpy[1], joint.rpy[2], "XYZ")
+        );
+        return makeTransformFromQuaternionAndTranslation(q, joint.xyz);
+    }
+
+    function makeMotionTransform(joint, qVals) {
+        if (joint.joint_type_string === "fixed") {
+            return identity4();
+        }
+
+        if (joint.joint_type_string === "revolute") {
+            const axis = toVector3Array(joint.axis);
+            const axisV = new THREE.Vector3(axis[0], axis[1], axis[2]).normalize();
+            const angle = qVals[joint.dof_idx] ?? 0;
+            const quat = new THREE.Quaternion().setFromAxisAngle(axisV, angle);
+            return makeTransformFromQuaternionAndTranslation(quat, [0, 0, 0]);
+        }
+
+        if (joint.joint_type_string === "prismatic") {
+            const axis = toVector3Array(joint.axis);
+            const axisV = new THREE.Vector3(axis[0], axis[1], axis[2]).normalize();
+            const displacement = qVals[joint.dof_idx] ?? 0;
+            const t = axisV.multiplyScalar(displacement);
+            return makeTransformFromQuaternionAndTranslation(new THREE.Quaternion(), [t.x, t.y, t.z]);
+        }
+
+        if (joint.joint_type_string === "floating") {
+            const tIdx = joint.translation_dof_idxs ?? [0, 1, 2];
+            const rIdx = joint.rotation_dof_idxs ?? [3, 4, 5];
+            const t = [qVals[tIdx[0]] ?? 0, qVals[tIdx[1]] ?? 0, qVals[tIdx[2]] ?? 0];
+            const r = [qVals[rIdx[0]] ?? 0, qVals[rIdx[1]] ?? 0, qVals[rIdx[2]] ?? 0];
+            const quat = new THREE.Quaternion().setFromEuler(new THREE.Euler(r[0], r[1], r[2], "XYZ"));
+            return makeTransformFromQuaternionAndTranslation(quat, t);
+        }
+
+        return identity4();
+    }
+
+    function linkOrigin(T) {
+        return [T[0][3], T[1][3], T[2][3]];
+    }
+
+    function drawLinkFrame(T, axisLen, axisWidth) {
+        const p = linkOrigin(T);
+        const x = [T[0][0], T[1][0], T[2][0]];
+        const y = [T[0][1], T[1][1], T[2][1]];
+        const z = [T[0][2], T[1][2], T[2][2]];
+        const px = [p[0] + axisLen * x[0], p[1] + axisLen * x[1], p[2] + axisLen * x[2]];
+        const py = [p[0] + axisLen * y[0], p[1] + axisLen * y[1], p[2] + axisLen * y[2]];
+        const pz = [p[0] + axisLen * z[0], p[1] + axisLen * z[1], p[2] + axisLen * z[2]];
+        engine.draw_debug_line(p, px, false, axisWidth, 0xff0000, 1.0);
+        engine.draw_debug_line(p, py, false, axisWidth, 0x00ff00, 1.0);
+        engine.draw_debug_line(p, pz, false, axisWidth, 0x0000ff, 1.0);
+    }
+
+    function getVisibleHierarchyOrderMax() {
+        const totalOrders = robot.links.length;
+        if (totalOrders <= 2) {
+            return totalOrders - 1;
+        }
+        const minVisibleOrder = 1;
+        const maxAdditionalOrders = totalOrders - 2;
+        return minVisibleOrder + Math.floor(uiState.assemblyProgress * maxAdditionalOrders);
+    }
+
+    function computeAndApplyFK() {
+        const linkTransforms = new Array(robot.num_links()).fill(null);
+        linkTransforms[0] = identity4();
+        const maxVisibleOrder = getVisibleHierarchyOrderMax();
+
+        for (const joint of robot.joints) {
+            const parent = joint.parent_link_idx;
+            const child = joint.child_link_idx;
+            const TParent = parent === null ? identity4() : (linkTransforms[parent] ?? identity4());
+            const TStatic = makeStaticJointTransform(joint);
+            const TMotion = makeMotionTransform(joint, dofValues);
+            linkTransforms[child] = matMul4(matMul4(TParent, TStatic), TMotion);
+        }
+
+        for (let linkIdx = 0; linkIdx < robot.num_links(); linkIdx++) {
+            const T = linkTransforms[linkIdx] ?? identity4();
+            robot.set_link_mesh_pose_from_SE3_matrix(engine, linkIdx, T);
+            const linkOrder = robot.link_to_kinematic_hierarchy_order_idx[linkIdx];
+            const linkVisible = linkOrder <= maxVisibleOrder;
+            robot.set_link_mesh_visibility(engine, linkIdx, uiState.showMesh && linkVisible);
+            robot.set_link_wireframe_visibility(engine, linkIdx, uiState.showWireframe && linkVisible);
+        }
+
+        for (const joint of robot.joints) {
+            if (!showJointAxes[joint.joint_idx]) {
+                continue;
+            }
+            const childLinkIdx = joint.child_link_idx;
+            if (childLinkIdx === null) {
+                continue;
+            }
+            const childOrder = robot.link_to_kinematic_hierarchy_order_idx[childLinkIdx];
+            if (childOrder <= maxVisibleOrder) {
+                const T = linkTransforms[childLinkIdx] ?? identity4();
+                drawLinkFrame(T, uiState.axisLength, uiState.axisWidth);
+            }
+        }
+    }
+
+    engine.animation_loop(() => {
+        computeAndApplyFK();
+
+    });
+
+</script>
+</body>
+</html>
